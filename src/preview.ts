@@ -155,6 +155,7 @@ async function fixedWorkflow(github: GitHub, repo: string): Promise<number> {
 }
 
 function statusFromConclusion(conclusion: string | null | undefined): Status {
+  if (conclusion === "action_required") return "Waiting for build";
   if (conclusion === "cancelled") return "Build cancelled";
   if (conclusion === "skipped" || conclusion === "neutral") return "Build skipped";
   return "Build failed";

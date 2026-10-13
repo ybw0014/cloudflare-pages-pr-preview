@@ -242,6 +242,7 @@ test("closed fork PR updates the comment but never deploys", async () => {
 test("source CI in progress and failures update the comment without deploying", async (t) => {
   for (const [status, conclusion, expected] of [
     ["in_progress", null, "Building"],
+    ["completed", "action_required", "Waiting for build"],
     ["completed", "failure", "Build failed"],
     ["completed", "cancelled", "Build cancelled"],
     ["completed", "skipped", "Build skipped"],
@@ -258,6 +259,8 @@ test("source CI in progress and failures update the comment without deploying", 
         assert.equal(candidate.PREVIEW_STATUS, expected);
         assert.equal((await prepare(candidate, mock.fetcher)).should_deploy, false);
         assert.match(mock.comments[0].body, new RegExp(expected));
+        if (conclusion === "action_required")
+          assert.doesNotMatch(mock.comments[0].body, /Build failed/);
         assert.equal(
           mock.calls.some((call) => call.url.includes("/artifacts/99/zip")),
           false,
