@@ -1,0 +1,142 @@
+name: Cloudflare Pages PR Preview
+description: Safely deploy static previews for fork pull requests to Cloudflare Pages.
+inputs:
+  account-id:
+    description: Cloudflare account ID.
+    required: true
+  project-name:
+    description: Cloudflare Pages project name dedicated to this repository.
+    required: true
+  api-token:
+    description: Cloudflare API token with Pages deployment and project-read permissions.
+    required: true
+outputs:
+  deployment-url:
+    description: Unique deployment URL, or empty when no deployment was performed.
+    value: ${{ steps.finish.outputs.deployment-url }}
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version: 1.4.2
+        no-cache: true
+    - run: bun ci
+      shell: bash
+      working-directory: ${{ github.action_path }}
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 26
+        package-manager-cache: false
+    - id: project
+      run: node "$GITHUB_ACTION_PATH/src/preview.ts" project
+      shell: bash
+      env:
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.api-token }}
+    - id: associate
+      run: node "$GITHUB_ACTION_PATH/src/preview.ts" associate
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        PREVIEW_BRANCH: ${{ steps.project.outputs.production_branch }}
+    - id: prepare
+      if: steps.associate.outputs.publish == 'true'
+      run: node "$GITHUB_ACTION_PATH/src/preview.ts" prepare
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        PREVIEW_BRANCH: ${{ steps.project.outputs.production_branch }}
+        PR: ${{ steps.associate.outputs.pr }}
+        PR_HEAD: ${{ steps.associate.outputs.sha }}
+        HEAD_REPOSITORY_ID: ${{ steps.associate.outputs.head_repository_id }}
+        HEAD_REF: ${{ steps.associate.outputs.head_ref }}
+        BASE_BRANCH: ${{ steps.associate.outputs.base_branch }}
+        WORKFLOW_ID: ${{ steps.associate.outputs.workflow_id }}
+        RUN_ID: ${{ steps.associate.outputs.run_id }}
+        RUN_NUMBER: ${{ steps.associate.outputs.run_number }}
+        ATTEMPT: ${{ steps.associate.outputs.attempt }}
+        PREVIEW_STATUS: ${{ steps.associate.outputs.status }}
+        SHOULD_DEPLOY: ${{ steps.associate.outputs.deploy }}
+        ARTIFACT_ID: ${{ steps.associate.outputs.artifact_id }}
+        PR_CLOSED: ${{ steps.associate.outputs.closed }}
+        ZIP_PATH: ${{ runner.temp }}/pages-preview.zip
+        DOWNLOAD_DIR: ${{ runner.temp }}/pages-preview-download
+        BUILD_DIR: ${{ runner.temp }}/pages-preview-build
+        WRANGLER_DIR: ${{ runner.temp }}/pages-preview-wrangler
+    - id: deploy
+      if: steps.prepare.outputs.should_deploy == 'true'
+      uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+      with:
+        apiToken: ${{ inputs.api-token }}
+        accountId: ${{ inputs.account-id }}
+        wranglerVersion: "4.149.0"
+        command: pages deploy ${{ runner.temp }}/pages-preview-build --project-name ${{ inputs.project-name }} --branch pr-${{ steps.associate.outputs.pr }} --commit-hash ${{ steps.associate.outputs.sha }}
+        workingDirectory: ${{ runner.temp }}/pages-preview-wrangler
+        preCommands: node "$PREVIEW_ACTION_PATH/src/preview.ts" guard
+      env:
+        PREVIEW_ACTION_PATH: ${{ github.action_path }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.api-token }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        PREVIEW_BRANCH: ${{ steps.project.outputs.production_branch }}
+        PR: ${{ steps.associate.outputs.pr }}
+        PR_HEAD: ${{ steps.associate.outputs.sha }}
+        HEAD_REPOSITORY_ID: ${{ steps.associate.outputs.head_repository_id }}
+        HEAD_REF: ${{ steps.associate.outputs.head_ref }}
+        BASE_BRANCH: ${{ steps.associate.outputs.base_branch }}
+        WORKFLOW_ID: ${{ steps.associate.outputs.workflow_id }}
+        RUN_ID: ${{ steps.associate.outputs.run_id }}
+        RUN_NUMBER: ${{ steps.associate.outputs.run_number }}
+        ATTEMPT: ${{ steps.associate.outputs.attempt }}
+        PREVIEW_STATUS: ${{ steps.associate.outputs.status }}
+        SHOULD_DEPLOY: ${{ steps.associate.outputs.deploy }}
+        ARTIFACT_ID: ${{ steps.associate.outputs.artifact_id }}
+        PR_CLOSED: ${{ steps.associate.outputs.closed }}
+    - id: finish
+      if: always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.should_deploy == 'true'
+      run: node "$GITHUB_ACTION_PATH/src/preview.ts" finish
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        PREVIEW_BRANCH: ${{ steps.project.outputs.production_branch }}
+        PR: ${{ steps.associate.outputs.pr }}
+        PR_HEAD: ${{ steps.associate.outputs.sha }}
+        HEAD_REPOSITORY_ID: ${{ steps.associate.outputs.head_repository_id }}
+        HEAD_REF: ${{ steps.associate.outputs.head_ref }}
+        BASE_BRANCH: ${{ steps.associate.outputs.base_branch }}
+        WORKFLOW_ID: ${{ steps.associate.outputs.workflow_id }}
+        RUN_ID: ${{ steps.associate.outputs.run_id }}
+        RUN_NUMBER: ${{ steps.associate.outputs.run_number }}
+        ATTEMPT: ${{ steps.associate.outputs.attempt }}
+        PREVIEW_STATUS: ${{ steps.associate.outputs.status }}
+        SHOULD_DEPLOY: ${{ steps.associate.outputs.deploy }}
+        ARTIFACT_ID: ${{ steps.associate.outputs.artifact_id }}
+        PR_CLOSED: ${{ steps.associate.outputs.closed }}
+        DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
