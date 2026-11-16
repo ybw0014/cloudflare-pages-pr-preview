@@ -48,13 +48,14 @@ test("project fails closed for Cloudflare errors and invalid production branches
   }
 });
 
-test("only project lookup and official deploy/guard receive the Cloudflare token", async () => {
+test("only project lookup, preview cleanup, and official deploy/guard receive the Cloudflare token", async () => {
   const action = await readFile(new URL("../action.yml", import.meta.url), "utf8");
   assert.doesNotMatch(action, /^  branch:/m);
-  assert.equal((action.match(/CLOUDFLARE_API_TOKEN:/g) ?? []).length, 2);
+  assert.equal((action.match(/CLOUDFLARE_API_TOKEN:/g) ?? []).length, 3);
   assert.match(stepEnv(action, "project"), /CLOUDFLARE_API_TOKEN: \$\{\{ inputs\.api-token \}\}/);
+  assert.match(stepEnv(action, "cleanup"), /CLOUDFLARE_API_TOKEN: \$\{\{ inputs\.api-token \}\}/);
   const productionBranch = /PREVIEW_BRANCH: \$\{\{ steps\.project\.outputs\.production_branch \}\}/;
-  for (const id of ["associate", "prepare", "deploy", "finish"])
+  for (const id of ["associate", "prepare", "cleanup", "deploy", "finish"])
     assert.match(stepEnv(action, id), productionBranch, `${id} must receive PREVIEW_BRANCH`);
   assert.match(action, /preCommands: node "\$PREVIEW_ACTION_PATH\/src\/preview\.ts" guard/);
 });

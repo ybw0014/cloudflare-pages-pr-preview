@@ -72,7 +72,7 @@ The fork's first workflow run may require a maintainer to approve it in GitHub A
 
 - `account-id` and `project-name` are required. The project name must be lowercase letters, digits, and single hyphens.
 - The project lookup reads Cloudflare's configured production branch; only pull requests targeting that branch are previewed. GitHub's default branch is not used for selection.
-- Pass `api-token` from `secrets.CLOUDFLARE_API_TOKEN` as shown; do not use `secrets: inherit`. The token is exposed only to the trusted project lookup and the official Wrangler deployment step/guard. Use an account-scoped token with only the Cloudflare Pages permissions needed to deploy and read project configuration. Cloudflare does not offer per-project token scope, so that permission applies to every Pages project in the account; use a dedicated account if that blast radius is unacceptable.
+- Pass `api-token` from `secrets.CLOUDFLARE_API_TOKEN` as shown; do not use `secrets: inherit`. The token is exposed only to the trusted project lookup, the preview cleanup step, and the official Wrangler deployment step/guard. Use an account-scoped token with only the Cloudflare Pages permissions needed to deploy, delete, and read project configuration. Cloudflare does not offer per-project token scope, so that permission applies to every Pages project in the account; use a dedicated account if that blast radius is unacceptable.
 - The caller grants only `actions: read`, `contents: read`, and `pull-requests: write`. The action never checks out caller or PR source code; its own pinned action source is used to run the trusted scripts.
 - The `api-token` input must be supplied from a GitHub secret as shown, not a literal. GitHub masks secret values; do not pass tokens from untrusted workflow data.
 - Fork build artifacts are treated as untrusted data; their JavaScript, Wrangler configuration, and Functions are never executed.
@@ -84,7 +84,7 @@ Each caller repository must use its **own Cloudflare Pages project**. Preview br
 ## Limits and operational notes
 
 - ZIP download: 256 MiB; at most 20,000 entries; each file at most 25 MiB; expanded archive at most 1 GiB. Unsafe paths, duplicate/conflicting paths, symlinks, special files, and a root `_worker.js` are rejected.
-- There is no preview search index or cleanup. Closing a PR updates its comment but does not delete Cloudflare deployments.
+- Closing or merging a PR deletes the `pr-<number>` preview deployments from Cloudflare Pages and marks the bot comment **Preview deleted**. Deletion lists the project's preview deployments and removes only those whose trigger branch is exactly `pr-<number>`; every deployment of any other branch, including production, is left alone. If a deletion fails, the step fails and the comment stays **Pull request closed**, so it never claims a deletion that did not happen.
 - Cloudflare deployment and GitHub PR updates are not atomic. If the PR changes or closes while an upload is in progress, the completed deployment may exist but its URL is not recorded as the new successful preview. A maintainer deleting the bot comment removes its accepted-run watermark and weakens rollback protection; do not edit or delete the metadata marker.
 - The action does not run arbitrary PR scripts in the privileged job and does not search for or recover deployments outside the source artifact.
 - Node 26 is required to run the repository's TypeScript source directly. The caller's Actions runner uses the supported Node runtime for pinned GitHub Actions, which may differ.

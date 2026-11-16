@@ -12,6 +12,7 @@ const marker = "<!-- cloudflare-pages-pr-preview:v1 -->";
 const dataMarker = "<!-- cloudflare-pages-pr-preview:data ";
 const shaPattern = /^[a-f0-9]{40}$/i;
 const projectPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Env = Record<string, string | undefined>;
 type Status =
   | "Waiting for build"
@@ -23,7 +24,8 @@ type Status =
   | "Build skipped"
   | "Deployment failed"
   | "Deploy successful!"
-  | "Pull request closed";
+  | "Pull request closed"
+  | "Preview deleted";
 type Tuple = { run_number: number; attempt: number };
 type Successful = {
   url: string;
@@ -445,6 +447,106 @@ export async function project(env: Env, fetcher: typeof fetch = fetch): Promise<
   return cloudflareProductionBranch(env, fetcher);
 }
 
+function cloudflareProject(env: Env, suffix: string): string {
+  const account = need(env, "INPUT_ACCOUNT_ID");
+  const project = need(env, "INPUT_PROJECT_NAME");
+  if (!/^[A-Za-z0-9_-]+$/.test(account) || !projectPattern.test(project))
+    throw new Error("Invalid Cloudflare account or project");
+  return `${cloudflareApi}/accounts/${encodeURIComponent(account)}/pages/projects/${encodeURIComponent(project)}${suffix}`;
+}
+
+async function cloudflare<T>(
+  env: Env,
+  fetcher: typeof fetch,
+  url: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await fetcher(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${need(env, "CLOUDFLARE_API_TOKEN")}`,
+      Accept: "application/json",
+      ...init.headers,
+    },
+  });
+  if (!response.ok) throw new Error(`Cloudflare API request failed (${response.status})`);
+  const value = (await response.json()) as any;
+  if (value?.success !== true) throw new Error("Cloudflare API request was not successful");
+  return value.result as T;
+}
+
+async function previewDeployments(
+  env: Env,
+  fetcher: typeof fetch,
+  branch: string,
+): Promise<string[]> {
+  const perPage = 100;
+  const ids: string[] = [];
+  for (let page = 1; ; page++) {
+    const rows = await cloudflare<any[]>(
+      env,
+      fetcher,
+      cloudflareProject(env, `/deployments?env=preview&per_page=${perPage}&page=${page}`),
+    );
+    if (!Array.isArray(rows)) throw new Error("Unexpected Cloudflare deployments response");
+    for (const row of rows) {
+      if (row?.environment !== "preview" || row?.deployment_trigger?.metadata?.branch !== branch)
+        continue;
+      if (typeof row.id !== "string" || !uuidPattern.test(row.id))
+        throw new Error("Cloudflare deployment has an invalid identifier");
+      ids.push(row.id);
+    }
+    if (rows.length < perPage) return ids;
+  }
+}
+
+async function deleteDeployment(env: Env, fetcher: typeof fetch, id: string): Promise<boolean> {
+  const response = await fetcher(
+    cloudflareProject(env, `/deployments/${encodeURIComponent(id)}?force=true`),
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${need(env, "CLOUDFLARE_API_TOKEN")}`,
+        Accept: "application/json",
+      },
+    },
+  );
+  return response.ok;
+}
+
+export async function cleanup(env: Env, fetcher: typeof fetch = fetch): Promise<void> {
+  const c = candidateFromEnv(env);
+  if (!c.closed) throw new Error("Preview cleanup requires a closed pull request");
+  const project = need(env, "INPUT_PROJECT_NAME");
+  const { github, repo, repositoryId } = await eventData(env, fetcher);
+  await verifyCurrent(github, repo, repositoryId, c);
+  const current = await latestState(github, repo, repositoryId, c.workflow_id, project, c.pr);
+  if (
+    !current ||
+    current.status.name !== "Pull request closed" ||
+    current.status.sha !== c.sha ||
+    compare(current.accepted, { run_number: c.run_number, attempt: c.attempt }) !== 0
+  )
+    throw new Error("Preview cleanup requires the current closed-pull-request state");
+  const ids = await previewDeployments(env, fetcher, `pr-${c.pr}`);
+  const results = await Promise.all(ids.map((id) => deleteDeployment(env, fetcher, id)));
+  const failures = ids.filter((_, index) => !results[index]);
+  if (failures.length)
+    throw new Error(
+      `Could not delete ${failures.length} preview deployment(s): ${failures.join(", ")}`,
+    );
+  await storeState(
+    github,
+    repo,
+    repositoryId,
+    c.workflow_id,
+    project,
+    c.pr,
+    stateFrom({ ...c, status: "Preview deleted" }, repositoryId, current),
+  );
+  console.log(`::notice::Deleted ${ids.length} preview deployment(s) for pr-${c.pr}`);
+}
+
 export async function associate(env: Env, fetcher?: typeof fetch): Promise<Record<string, string>> {
   try {
     const { candidate } = await resolve(env, fetcher);
@@ -528,6 +630,7 @@ function parseState(
     "Deployment failed",
     "Deploy successful!",
     "Pull request closed",
+    "Preview deleted",
   ];
   if (!statuses.includes(value.status.name))
     throw new Error("Preview bot comment has invalid status metadata");
@@ -559,6 +662,7 @@ function statusText(status: Status): string {
     "Deployment failed": "❌ Deployment failed",
     "Deploy successful!": "✅ Deploy successful!",
     "Pull request closed": "⚪ Pull request closed",
+    "Preview deleted": "⚪ Preview deleted",
   }[status];
 }
 
@@ -576,7 +680,7 @@ function commentBody(project: string, repo: string, state: State): string {
     cells.push(
       `<tr><td>Branch Preview URL:</td><td><a href="https://pr-${state.pr}.${project}.pages.dev">https://pr-${state.pr}.${project}.pages.dev</a></td></tr>`,
     );
-  } else if (state.last_success) {
+  } else if (state.last_success && status !== "Preview deleted") {
     const runUrl = `https://github.com/${repo}/actions/runs/${state.last_success.run_id}/attempts/${state.last_success.attempt}`;
     cells.push(
       `<tr><td>Last successful preview:</td><td><a href="${state.last_success.url}">${state.last_success.url}</a> (<code>${state.last_success.sha.slice(0, 7)}</code>, <a href="${runUrl}">run #${state.last_success.run_number}</a>)</td></tr>`,
@@ -1032,9 +1136,10 @@ async function main(): Promise<void> {
   else if (mode === "associate") await output(process.env, await associate(process.env));
   else if (mode === "prepare") await output(process.env, await prepare(process.env));
   else if (mode === "guard") await guard(process.env);
+  else if (mode === "cleanup") await cleanup(process.env);
   else if (mode === "finish")
     await output(process.env, { "deployment-url": await finish(process.env) });
-  else throw new Error("Expected mode project, associate, prepare, guard, or finish");
+  else throw new Error("Expected mode project, associate, prepare, guard, cleanup, or finish");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

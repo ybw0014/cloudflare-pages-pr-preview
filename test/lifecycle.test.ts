@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { associate, finish, guard, prepare } from "../src/preview.ts";
+import { associate, cleanup, finish, guard, prepare } from "../src/preview.ts";
 import { makeZip } from "./zip-fixture.ts";
 
 const sha = "a".repeat(40);
@@ -75,6 +75,7 @@ async function environment(name: "pull_request_target" | "workflow_run", payload
     GITHUB_EVENT_PATH: eventPath,
     INPUT_ACCOUNT_ID: "acct",
     INPUT_PROJECT_NAME: "pages",
+    CLOUDFLARE_API_TOKEN: "cf-secret",
     PREVIEW_BRANCH: "main",
   };
   return { dir, env };
@@ -89,6 +90,8 @@ function api(
     commentStatus?: number;
     patchStatus?: number;
     artifactExpired?: boolean;
+    deployments?: Array<{ id: string; branch: string; environment?: string }>;
+    deleteStatus?: number;
   } = {},
 ) {
   const calls: Array<{ url: string; method: string; body?: any }> = [];
@@ -173,6 +176,26 @@ function api(
       if (comment) comment.body = body.body;
       return response(comment ?? {});
     }
+    if (
+      url.includes("/pages/projects/pages/deployments?") ||
+      url.includes("/pages/projects/pages/deployments")
+    ) {
+      const parsed = new URL(url);
+      if (method === "DELETE") {
+        if (options.deleteStatus && options.deleteStatus >= 400)
+          return response({}, options.deleteStatus);
+        return response({ success: true, result: null });
+      }
+      const page = Number(parsed.searchParams.get("page")) || 1;
+      const rows = (options.deployments ?? [])
+        .filter((entry) => entry.environment !== "production")
+        .map((entry) => ({
+          id: entry.id,
+          environment: entry.environment ?? "preview",
+          deployment_trigger: { metadata: { branch: entry.branch } },
+        }));
+      return response({ success: true, result: page === 1 ? rows : [] });
+    }
     throw new Error(`Unexpected mock API request: ${method} ${url}`);
   }) as typeof fetch;
   return {
@@ -234,6 +257,73 @@ test("closed fork PR updates the comment but never deploys", async () => {
       mock.calls.some((call) => call.url.includes("/artifacts/99/zip")),
       false,
     );
+  } finally {
+    await rm(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test("closed fork PR deletes its own preview deployments and updates the comment", async () => {
+  const ctx = await environment("pull_request_target", event("pull_request_target", "closed"));
+  const deployments = [
+    { id: "11111111-1111-1111-1111-111111111111", branch: "pr-12" },
+    { id: "22222222-2222-2222-2222-222222222222", branch: "pr-12" },
+    { id: "33333333-3333-3333-3333-333333333333", branch: "pr-13" },
+    { id: "44444444-4444-4444-4444-444444444444", branch: "main", environment: "production" },
+  ];
+  const mock = api({ pull: pr("closed"), deployments });
+  try {
+    const candidate = await associateCandidate(ctx.env, mock.fetcher);
+    assert.equal((await prepare(candidate, mock.fetcher)).should_deploy, false);
+    await cleanup(candidate, mock.fetcher);
+    const deleted = mock.calls
+      .filter((call) => call.method === "DELETE")
+      .map((call) => new URL(call.url).pathname.split("/").at(-1));
+    assert.deepEqual(deleted, [deployments[0].id, deployments[1].id]);
+    assert.ok(
+      mock.calls
+        .filter((call) => call.method === "DELETE")
+        .every((call) => new URL(call.url).searchParams.get("force") === "true"),
+    );
+    assert.match(mock.comments[0].body, /Preview deleted/);
+    assert.doesNotMatch(mock.comments[0].body, /Preview URL:/);
+  } finally {
+    await rm(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test("reopened pull request skips preview cleanup", async () => {
+  const ctx = await environment("pull_request_target", event("pull_request_target", "closed"));
+  const mock = api({
+    pull: pr("closed"),
+    deployments: [{ id: "11111111-1111-1111-1111-111111111111", branch: "pr-12" }],
+  });
+  try {
+    const candidate = await associateCandidate(ctx.env, mock.fetcher);
+    await prepare(candidate, mock.fetcher);
+    mock.currentPull.state = "open";
+    await assert.rejects(() => cleanup(candidate, mock.fetcher), /before preview state update/);
+    assert.equal(
+      mock.calls.some((call) => call.method === "DELETE"),
+      false,
+    );
+  } finally {
+    await rm(ctx.dir, { recursive: true, force: true });
+  }
+});
+
+test("failed preview deletion keeps the closed comment unchanged", async () => {
+  const ctx = await environment("pull_request_target", event("pull_request_target", "closed"));
+  const mock = api({
+    pull: pr("closed"),
+    deployments: [{ id: "11111111-1111-1111-1111-111111111111", branch: "pr-12" }],
+    deleteStatus: 500,
+  });
+  try {
+    const candidate = await associateCandidate(ctx.env, mock.fetcher);
+    await prepare(candidate, mock.fetcher);
+    await assert.rejects(() => cleanup(candidate, mock.fetcher), /Could not delete 1 preview/);
+    assert.match(mock.comments[0].body, /Pull request closed/);
+    assert.doesNotMatch(mock.comments[0].body, /Preview deleted/);
   } finally {
     await rm(ctx.dir, { recursive: true, force: true });
   }
